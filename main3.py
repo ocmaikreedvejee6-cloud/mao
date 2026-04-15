@@ -5,16 +5,14 @@ import time
 import requests
 import smtplib
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from flask import Flask, Response
-import threading
 
 # ================= CONFIG =================
-SERIAL_PORT = '/dev/ttyUSB0'
 BAUD_RATE = 9600
 
-# 🔐 PUT YOUR OWN VALUES HERE
 TELEGRAM_TOKEN = "8490765768:AAFU-Vpi0HAiS5_2V2mcboWYeiG8W4neiVE"
 CHAT_ID = "7175315173"
 
@@ -22,13 +20,9 @@ CONFIDENCE_THRESHOLD = 50
 FACE_TIMEOUT = 3
 TELEGRAM_COOLDOWN = 30
 
-# 🔐 EMAIL (USE APP PASSWORD ONLY)
 EMAIL_ADDRESS = "growpfiveim312@gmail.com"
-EMAIL_PASSWORD = "Gwapokaayoko"
+EMAIL_PASSWORD = "qerlwnbhfcaprcll"
 RECEIVER_EMAIL = "ocmaikreedvejee6@gmail.com"
-
-RASPBERRY_PI_IP = "192.168.1.246"
-STREAM_URL = f"http://{RASPBERRY_PI_IP}:5000"
 
 PH_TIMEZONE = timezone(timedelta(hours=8))
 
@@ -38,28 +32,60 @@ last_telegram_time = 0
 unknown_triggered = False
 relay_state = False
 
+arduino = None
+cap = None
 frame_global = None
 lock = threading.Lock()
 
-# ================= LOAD MODEL =================
-recognizer = cv2.face.LBPHFaceRecognizer_create()
-recognizer.read("trainer1.yml")
+# ================= AUTO ARDUINO CONNECT =================
+def connect_arduino():
+    global arduino
 
-label_map = np.load("labels1.npy", allow_pickle=True).item()
+    ports = ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0", "/dev/ttyUSB1"]
 
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+    for p in ports:
+        try:
+            arduino = serial.Serial(p, BAUD_RATE, timeout=1)
+            time.sleep(2)
+            print(f"✅ Arduino connected: {p}")
+            return True
+        except:
+            continue
 
-# ================= ARDUINO =================
-arduino = serial.Serial(SERIAL_PORT, BAUD_RATE)
-time.sleep(2)
+    arduino = None
+    print("❌ Arduino not found")
+    return False
 
-# ================= CAMERA =================
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+def safe_write(cmd):
+    global arduino
 
-# ================= RELAY =================
+    if arduino is None:
+        connect_arduino()
+        return
+
+    try:
+        arduino.write(cmd.encode())
+    except:
+        print("⚠️ Arduino lost, reconnecting...")
+        arduino = None
+        connect_arduino()
+
+# ================= AUTO CAMERA DETECT =================
+def find_camera():
+    global cap
+
+    for i in range(5):
+        temp = cv2.VideoCapture(i)
+        if temp.isOpened():
+            print(f"✅ Camera found at index {i}")
+            cap = temp
+            return True
+        temp.release()
+
+    print("❌ No camera found")
+    return False
+
+# ================= RELAY CONTROL =================
 def set_relays(state):
     global relay_state
 
@@ -69,10 +95,10 @@ def set_relays(state):
     relay_state = state
 
     if state:
-        arduino.write(b'ON\n')
+        safe_write("ON\n")
         print("💡 RELAYS ON")
     else:
-        arduino.write(b'OFF\n')
+        safe_write("OFF\n")
         print("❌ RELAYS OFF")
 
 # ================= TELEGRAM =================
@@ -90,10 +116,7 @@ def send_telegram_image(image_path, message):
             r = requests.post(
                 url,
                 files={"photo": photo},
-                data={
-                    "chat_id": CHAT_ID,
-                    "caption": message + f"\n📡 Live: {STREAM_URL}"
-                }
+                data={"chat_id": CHAT_ID, "caption": message}
             )
 
         if r.status_code == 200:
@@ -109,8 +132,7 @@ def send_email(image_path):
     msg["Subject"] = "Unknown Person Detected"
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = RECEIVER_EMAIL
-
-    msg.set_content(f"Unknown detected.\nLive: {STREAM_URL}")
+    msg.set_content("Unknown detected")
 
     try:
         with open(image_path, "rb") as f:
@@ -124,6 +146,14 @@ def send_email(image_path):
 
     except Exception as e:
         print("Email error:", e)
+
+# ================= LOAD MODEL =================
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+recognizer.read("trainer1.yml")
+
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
 # ================= FLASK =================
 app = Flask(__name__)
@@ -139,7 +169,10 @@ def generate_frames():
             frame = frame_global.copy()
 
         _, buffer = cv2.imencode(".jpg", frame)
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
+
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" +
+               buffer.tobytes() + b"\r\n")
 
 @app.route("/")
 def video_feed():
@@ -151,22 +184,39 @@ def run_flask():
 
 # ================= CAMERA THREAD =================
 def camera_thread():
-    global frame_global
+    global frame_global, cap
 
     while True:
+        if cap is None:
+            find_camera()
+            time.sleep(2)
+            continue
+
         ret, frame = cap.read()
-        if ret:
-            frame = cv2.resize(frame, (640, 480))
-            with lock:
-                frame_global = frame
+
+        if not ret:
+            print("⚠️ Camera lost, reconnecting...")
+            cap.release()
+            cap = None
+            time.sleep(2)
+            continue
+
+        frame = cv2.resize(frame, (640, 480))
+
+        with lock:
+            frame_global = frame
 
 # ================= MAIN LOOP =================
 def main():
     global last_face_time, unknown_triggered
 
-    print("🚀 System Running...")
+    print("🚀 System Starting...")
+
+    connect_arduino()
+    find_camera()
 
     while True:
+
         if frame_global is None:
             continue
 
@@ -179,7 +229,7 @@ def main():
         now = time.time()
         face_detected = len(faces) > 0
 
-        # ================= RELAY =================
+        # RELAY LOGIC
         if face_detected:
             last_face_time = now
             set_relays(True)
@@ -188,7 +238,7 @@ def main():
             if now - last_face_time > FACE_TIMEOUT:
                 set_relays(False)
 
-        # ================= FACE CHECK =================
+        # FACE CHECK
         for (x, y, w, h) in faces:
             face = gray[y:y+h, x:x+w]
 
@@ -197,23 +247,22 @@ def main():
             except:
                 continue
 
-            if confidence > CONFIDENCE_THRESHOLD:
-                if not unknown_triggered:
+            if confidence > CONFIDENCE_THRESHOLD and not unknown_triggered:
 
-                    if not os.path.exists("captures"):
-                        os.makedirs("captures")
+                if not os.path.exists("captures"):
+                    os.makedirs("captures")
 
-                    now_ph = datetime.now(PH_TIMEZONE)
-                    timestamp = now_ph.strftime("%Y-%m-%d %H:%M:%S")
-                    file_time = now_ph.strftime("%Y%m%d_%H%M%S")
+                now_ph = datetime.now(PH_TIMEZONE)
+                timestamp = now_ph.strftime("%Y-%m-%d %H:%M:%S")
+                file_time = now_ph.strftime("%Y%m%d_%H%M%S")
 
-                    img_path = f"captures/unknown_{file_time}.jpg"
-                    cv2.imwrite(img_path, frame)
+                img_path = f"captures/unknown_{file_time}.jpg"
+                cv2.imwrite(img_path, frame)
 
-                    send_telegram_image(img_path, f"Unknown detected\nTime: {timestamp}")
-                    send_email(img_path)
+                send_telegram_image(img_path, f"Unknown detected\nTime: {timestamp}")
+                send_email(img_path)
 
-                    unknown_triggered = True
+                unknown_triggered = True
 
         time.sleep(0.03)
 
